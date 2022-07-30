@@ -100,6 +100,22 @@ static void CreateFile(const char *path) {
   }
 }
 
+static void UnmountDev() {
+  const char *devs[] = {"/dev/null", "/dev/random", "/dev/urandom", "/dev/zero",
+                        NULL};
+  for (int i = 0; devs[i] != NULL; i++) {
+    if (umount2(devs[i], MNT_DETACH) < 0) {
+      DIE("umount2");
+    }
+    if (remove(devs[i]) < 0) {
+      DIE("remove");
+    }
+  }
+  if (remove("/dev/fd") < 0) {
+    DIE("remove");
+  }
+}
+
 // Creates an empty file at 'path' by hard linking it from a known empty file.
 // This is over two times faster than creating empty files via open() on
 // certain filesystems (e.g. XFS).
@@ -493,12 +509,11 @@ static void SpawnChild() {
 }
 
 static int WaitForChild() {
+  // Wait for some process to exit. This includes reparented processes in our
+  // PID namespace.
+  int status;
   while (true) {
-    // Wait for some process to exit. This includes reparented processes in our
-    // PID namespace.
-    int status;
     const pid_t pid = TEMP_FAILURE_RETRY(wait(&status));
-
     if (pid < 0) {
       // We don't expect any errors besides EINTR. In particular, ECHILD should
       // be impossible because we haven't yet seen global_child_pid exit.
@@ -509,23 +524,25 @@ static int WaitForChild() {
 
     // If this isn't our child's PID, there's nothing further to do; we've
     // successfully reaped a zombie.
-    if (pid != global_child_pid) {
-      continue;
+    if (pid == global_child_pid) {
+      break;
     }
-
-    // If the child exited due to a signal, log that fact and exit with the same
-    // status.
-    if (WIFSIGNALED(status)) {
-      const int signal = WTERMSIG(status);
-      PRINT_DEBUG("child exited due to signal %d", WTERMSIG(status));
-      return 128 + signal;
-    }
-
-    // Otherwise it must have exited normally.
-    const int exit_code = WEXITSTATUS(status);
-    PRINT_DEBUG("child exited normally with code %d", exit_code);
-    return exit_code;
   }
+
+  UnmountDev();
+
+  // If the child exited due to a signal, log that fact and exit with the same
+  // status.
+  if (WIFSIGNALED(status)) {
+    const int signal = WTERMSIG(status);
+    PRINT_DEBUG("child exited due to signal %d", WTERMSIG(status));
+    return 128 + signal;
+  }
+
+  // Otherwise it must have exited normally.
+  const int exit_code = WEXITSTATUS(status);
+  PRINT_DEBUG("child exited normally with code %d", exit_code);
+  return exit_code;
 }
 
 static void MountSandboxAndGoThere() {
@@ -544,6 +561,12 @@ static void CreateEmptyFile() {
     DIE("CreateTarget tmp")
   }
   CreateFile("tmp/empty_file");
+}
+
+static void RemoveEmptyFile() {
+  if (remove("tmp/empty_file") < 0) {
+    DIE("remove");
+  }
 }
 
 static void MountDev() {
@@ -672,6 +695,7 @@ int Pid1Main(void *sync_pipe_param) {
     MountDev();
     MountProc();
     MountAllMounts();
+    RemoveEmptyFile();
     ChangeRoot();
   } else {
     MountFilesystems();
