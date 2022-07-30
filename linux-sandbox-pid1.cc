@@ -40,6 +40,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
 #include <string>
 
 #ifndef MS_REC
@@ -48,12 +49,126 @@
 #include <linux/fs.h>
 #endif
 
+#ifndef TEMP_FAILURE_RETRY
+// Some C standard libraries like musl do not define this macro, so we'll
+// include our own version for compatibility.
+#define TEMP_FAILURE_RETRY(exp)            \
+  ({                                       \
+    decltype(exp) _rc;                     \
+    do {                                   \
+      _rc = (exp);                         \
+    } while (_rc == -1 && errno == EINTR); \
+    _rc;                                   \
+  })
+#endif  // TEMP_FAILURE_RETRY
+
 #include "linux-sandbox-options.h"
 #include "linux-sandbox.h"
 #include "logging.h"
 #include "process-tools.h"
 
+static void WriteFile(const std::string &filename, const char *fmt, ...) {
+  FILE *stream = fopen(filename.c_str(), "w");
+  if (stream == nullptr) {
+    DIE("fopen(%s)", filename.c_str());
+  }
+
+  va_list ap;
+  va_start(ap, fmt);
+  int r = vfprintf(stream, fmt, ap);
+  va_end(ap);
+
+  if (r < 0) {
+    DIE("vfprintf");
+  }
+
+  if (fclose(stream) != 0) {
+    DIE("fclose(%s)", filename.c_str());
+  }
+}
+
 static int global_child_pid;
+
+// Helper methods
+static void CreateFile(const char *path) {
+  int handle = open(path, O_CREAT | O_WRONLY | O_EXCL, 0666);
+  if (handle < 0) {
+    DIE("open");
+  }
+  if (close(handle) < 0) {
+    DIE("close");
+  }
+}
+
+// Creates an empty file at 'path' by hard linking it from a known empty file.
+// This is over two times faster than creating empty files via open() on
+// certain filesystems (e.g. XFS).
+static void LinkFile(const char *path) {
+  if (link("tmp/empty_file", path) < 0) {
+    DIE("link %s", path);
+  }
+}
+
+// Recursively creates the file or directory specified in "path" and its parent
+// directories.
+// Return -1 on failure and sets errno to:
+//    EINVAL   path is null
+//    ENOTDIR  path exists and is not a directory
+//    EEXIST   path exists and is a directory
+//    ENOENT   stat call with the path failed
+static int CreateTarget(const char *path, bool is_directory) {
+  if (path == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  struct stat sb;
+  // If the path already exists...
+
+  if (stat(path, &sb) == 0) {
+    if (is_directory && S_ISDIR(sb.st_mode)) {
+      // and it's a directory and supposed to be a directory, we're done here.
+      return 0;
+    } else if (!is_directory && S_ISREG(sb.st_mode)) {
+      // and it's a regular file and supposed to be one, we're done here.
+      return 0;
+    } else {
+      // otherwise something is really wrong.
+      errno = is_directory ? ENOTDIR : EEXIST;
+      return -1;
+    }
+  } else {
+    // If stat failed because of any error other than "the path does not exist",
+    // this is an error.
+    if (errno != ENOENT) {
+      return -1;
+    }
+  }
+
+  // Create the parent directory.
+  {
+    char *buf, *dir;
+
+    if (!(buf = strdup(path))) DIE("strdup");
+
+    dir = dirname(buf);
+    if (CreateTarget(dir, true) < 0) {
+      DIE("CreateTarget %s", dir);
+    }
+
+    free(buf);
+  }
+
+  if (is_directory) {
+    if (mkdir(path, 0755) < 0) {
+      DIE("mkdir");
+    }
+  } else {
+    LinkFile(path);
+  }
+
+  return 0;
+}
 
 static void SetupSelfDestruction(int *sync_pipe) {
   // We could also poll() on the pipe fd to find out when the parent goes away,
@@ -93,26 +208,6 @@ static void SetupMountNamespace() {
   }
 }
 
-static void WriteFile(const std::string &filename, const char *fmt, ...) {
-  FILE *stream = fopen(filename.c_str(), "w");
-  if (stream == nullptr) {
-    DIE("fopen(%s)", filename.c_str());
-  }
-
-  va_list ap;
-  va_start(ap, fmt);
-  int r = vfprintf(stream, fmt, ap);
-  va_end(ap);
-
-  if (r < 0) {
-    DIE("vfprintf");
-  }
-
-  if (fclose(stream) != 0) {
-    DIE("fclose(%s)", filename.c_str());
-  }
-}
-
 static void SetupUserNamespace() {
   // Disable needs for CAP_SETGID.
   struct stat sb;
@@ -126,7 +221,8 @@ static void SetupUserNamespace() {
     }
   }
 
-  int inner_uid, inner_gid;
+  uid_t inner_uid;
+  gid_t inner_gid;
   if (opt.fake_root) {
     // Change our username to 'root'.
     inner_uid = 0;
@@ -145,9 +241,8 @@ static void SetupUserNamespace() {
     inner_uid = global_outer_uid;
     inner_gid = global_outer_gid;
   }
-
-  WriteFile("/proc/self/uid_map", "%d %d 1\n", inner_uid, global_outer_uid);
-  WriteFile("/proc/self/gid_map", "%d %d 1\n", inner_gid, global_outer_gid);
+  WriteFile("/proc/self/uid_map", "%u %u 1\n", inner_uid, global_outer_uid);
+  WriteFile("/proc/self/gid_map", "%u %u 1\n", inner_gid, global_outer_gid);
 }
 
 static void SetupUtsNamespace() {
@@ -174,6 +269,19 @@ static void MountFilesystems() {
   // do this is by bind-mounting it upon itself.
   PRINT_DEBUG("working dir: %s", opt.working_dir.c_str());
 
+  // An attempt to mount the sandbox in tmpfs will always fail, so this block is
+  // slightly redundant with the next mount() check, but dumping the mount()
+  // syscall is incredibly cryptic, so we explicitly check against and warn
+  // about attempts to use tmpfs.
+  for (const std::string &tmpfs_dir : opt.tmpfs_dirs) {
+    if (opt.working_dir.find(tmpfs_dir) == 0) {
+      DIE("The sandbox working directory cannot be below a path where we mount "
+          "tmpfs (you requested mounting %s in %s). Is your --output_base= "
+          "below one of your --sandbox_tmpfs_path values?",
+          opt.working_dir.c_str(), tmpfs_dir.c_str());
+    }
+  }
+
   if (mount(opt.working_dir.c_str(), opt.working_dir.c_str(), nullptr, MS_BIND,
             nullptr) < 0) {
     DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str(),
@@ -181,8 +289,8 @@ static void MountFilesystems() {
   }
 
   for (size_t i = 0; i < opt.bind_mount_sources.size(); i++) {
-    const std::string& source = opt.bind_mount_sources.at(i);
-    const std::string& target = opt.bind_mount_targets.at(i);
+    const std::string &source = opt.bind_mount_sources.at(i);
+    const std::string &target = opt.bind_mount_targets.at(i);
     PRINT_DEBUG("bind mount: %s -> %s", source.c_str(), target.c_str());
     if (mount(source.c_str(), target.c_str(), nullptr, MS_BIND, nullptr) < 0) {
       DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", source.c_str(),
@@ -275,10 +383,19 @@ static void MakeFilesystemMostlyReadOnly() {
       // mount is a broken NFS mount. In the ideal case, the user would either
       // fix or remove that mount, but in cases where that's not possible, we
       // should just ignore it.
-      if (errno != EACCES && errno != EPERM && errno != EINVAL &&
-          errno != ENOENT && errno != ESTALE) {
-        DIE("remount(nullptr, %s, nullptr, %d, nullptr)", ent->mnt_dir,
-            mountFlags);
+      switch (errno) {
+        case EACCES:
+        case EPERM:
+        case EINVAL:
+        case ENOENT:
+        case ESTALE:
+          PRINT_DEBUG(
+              "remount(nullptr, %s, nullptr, %d, nullptr) failure (%m) ignored",
+              ent->mnt_dir, mountFlags);
+          break;
+        default:
+          DIE("remount(nullptr, %s, nullptr, %d, nullptr)", ent->mnt_dir,
+              mountFlags);
       }
     }
   }
@@ -325,55 +442,23 @@ static void SetupNetworking() {
   }
 }
 
-static void EnterSandbox() {
-  if (chdir(opt.working_dir.c_str()) < 0) {
-    DIE("chdir(%s)", opt.working_dir.c_str());
+static void EnterWorkingDirectory() {
+  std::string path = opt.working_dir;
+  if (opt.hermetic) {
+    path = path.substr(opt.sandbox_root.size() + 1);
+  }
+
+  if (chdir(path.c_str()) < 0) {
+    DIE("chdir(%s)", path.c_str());
   }
 }
 
 static void ForwardSignal(int signum) {
-  PRINT_DEBUG("ForwardSignal(%d)", signum);
   kill(-global_child_pid, signum);
 }
 
-static void SetupSignalHandlers() {
-  ClearSignalMask();
-
-  for (int signum = 1; signum < NSIG; signum++) {
-    switch (signum) {
-      // Some signals should indeed kill us and not be forwarded to the child,
-      // thus we can use the default handler.
-      case SIGABRT:
-      case SIGBUS:
-      case SIGFPE:
-      case SIGILL:
-      case SIGSEGV:
-      case SIGSYS:
-      case SIGTRAP:
-        break;
-      // It's fine to use the default handler for SIGCHLD, because we use
-      // waitpid() in the main loop to wait for children to die anyway.
-      case SIGCHLD:
-        break;
-      // One does not simply install a signal handler for these two signals
-      case SIGKILL:
-      case SIGSTOP:
-        break;
-      // Ignore SIGTTIN and SIGTTOU, as we hand off the terminal to the child in
-      // SpawnChild().
-      case SIGTTIN:
-      case SIGTTOU:
-        IgnoreSignal(signum);
-        break;
-      // All other signals should be forwarded to the child.
-      default:
-        InstallSignalHandler(signum, ForwardSignal);
-        break;
-    }
-  }
-}
-
 static void SpawnChild() {
+  PRINT_DEBUG("calling fork...");
   global_child_pid = fork();
 
   if (global_child_pid < 0) {
@@ -386,7 +471,7 @@ static void SpawnChild() {
 
     // Try to assign our terminal to the child process.
     if (tcsetpgrp(STDIN_FILENO, getpgrp()) < 0 && errno != ENOTTY) {
-      DIE("tcsetpgrp")
+      DIE("tcsetpgrp");
     }
 
     // Unblock all signals, restore default handlers.
@@ -402,60 +487,213 @@ static void SpawnChild() {
     if (execvp(opt.args[0], opt.args.data()) < 0) {
       DIE("execvp(%s, %p)", opt.args[0], opt.args.data());
     }
+  } else {
+    PRINT_DEBUG("child started with PID %d", global_child_pid);
   }
 }
 
-static void WaitForChild() {
-  while (1) {
-    // Check for zombies to be reaped and exit, if our own child exited.
+static int WaitForChild() {
+  while (true) {
+    // Wait for some process to exit. This includes reparented processes in our
+    // PID namespace.
     int status;
-    pid_t killed_pid = waitpid(-1, &status, 0);
-    PRINT_DEBUG("waitpid returned %d", killed_pid);
+    const pid_t pid = TEMP_FAILURE_RETRY(wait(&status));
 
-    if (killed_pid < 0) {
-      // Our PID1 process got a signal that interrupted the waitpid() call and
-      // that was either ignored or forwared to the child. This is expected &
-      // fine, just continue waiting.
-      if (errno == EINTR) {
-        continue;
+    if (pid < 0) {
+      // We don't expect any errors besides EINTR. In particular, ECHILD should
+      // be impossible because we haven't yet seen global_child_pid exit.
+      DIE("wait");
+    }
+
+    PRINT_DEBUG("wait returned pid=%d, status=0x%02x", pid, status);
+
+    // If this isn't our child's PID, there's nothing further to do; we've
+    // successfully reaped a zombie.
+    if (pid != global_child_pid) {
+      continue;
+    }
+
+    // If the child exited due to a signal, log that fact and exit with the same
+    // status.
+    if (WIFSIGNALED(status)) {
+      const int signal = WTERMSIG(status);
+      PRINT_DEBUG("child exited due to signal %d", WTERMSIG(status));
+      return 128 + signal;
+    }
+
+    // Otherwise it must have exited normally.
+    const int exit_code = WEXITSTATUS(status);
+    PRINT_DEBUG("child exited normally with code %d", exit_code);
+    return exit_code;
+  }
+}
+
+static void MountSandboxAndGoThere() {
+  if (mount(opt.sandbox_root.c_str(), opt.sandbox_root.c_str(), nullptr,
+            MS_BIND | MS_NOSUID, nullptr) < 0) {
+    DIE("mount");
+  }
+  if (chdir(opt.sandbox_root.c_str()) < 0) {
+    DIE("chdir(%s)", opt.sandbox_root.c_str());
+  }
+}
+
+static void CreateEmptyFile() {
+  // This is used as the base for bind mounting.
+  if (CreateTarget("tmp", true) < 0) {
+    DIE("CreateTarget tmp")
+  }
+  CreateFile("tmp/empty_file");
+}
+
+static void MountDev() {
+  if (CreateTarget("dev", true) < 0) {
+    DIE("CreateTarget /dev");
+  }
+  const char *devs[] = {"/dev/null", "/dev/random", "/dev/urandom", "/dev/zero",
+                        NULL};
+  for (int i = 0; devs[i] != NULL; i++) {
+    LinkFile(devs[i] + 1);
+    if (mount(devs[i], devs[i] + 1, NULL, MS_BIND, NULL) < 0) {
+      DIE("mount");
+    }
+  }
+  if (symlink("/proc/self/fd", "dev/fd") < 0) {
+    DIE("symlink");
+  }
+}
+
+static void MountAllMounts() {
+  for (const std::string &tmpfs_dir : opt.tmpfs_dirs) {
+    PRINT_DEBUG("tmpfs: %s", tmpfs_dir.c_str());
+    if (mount("tmpfs", tmpfs_dir.c_str(), "tmpfs",
+              MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr) < 0) {
+      DIE("mount(tmpfs, %s, tmpfs, MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr)",
+          tmpfs_dir.c_str());
+    }
+  }
+
+  // Make sure that our working directory is a mount point. The easiest way to
+  // do this is by bind-mounting it upon itself.
+  if (mount(opt.working_dir.c_str(), opt.working_dir.c_str(), nullptr, MS_BIND,
+            nullptr) < 0) {
+    DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str(),
+        opt.working_dir.c_str());
+  }
+  for (int i = 0; i < (signed)opt.bind_mount_sources.size(); i++) {
+    if (opt.debug) {
+      if (strcmp(opt.bind_mount_sources[i].c_str(),
+                 opt.bind_mount_targets[i].c_str()) == 0) {
+        // The file is mounted to the same path inside the sandbox, as outside
+        // (e.g. /home/user -> <sandbox>/home/user), so we'll just show a
+        // simplified version of the mount command.
+        PRINT_DEBUG("mount: %s\n", opt.bind_mount_sources[i].c_str());
+      } else {
+        // The file is mounted to a custom location inside the sandbox.
+        // Create a user-friendly string for the sandboxed path and show it.
+        const std::string user_friendly_mount_target("<sandbox>" +
+                                                     opt.bind_mount_targets[i]);
+        PRINT_DEBUG("mount: %s -> %s\n", opt.bind_mount_sources[i].c_str(),
+                    user_friendly_mount_target.c_str());
       }
-      DIE("waitpid")
-    } else {
-      if (killed_pid == global_child_pid) {
-        // If the child process we spawned earlier terminated, we'll also
-        // terminate. We can simply _exit() here, because the Linux kernel will
-        // kindly SIGKILL all remaining processes in our PID namespace once we
-        // exit.
-        if (WIFSIGNALED(status)) {
-          PRINT_DEBUG("child died due to signal %d", WTERMSIG(status));
-          _exit(128 + WTERMSIG(status));
-        } else {
-          PRINT_DEBUG("child exited with code %d", WEXITSTATUS(status));
-          _exit(WEXITSTATUS(status));
-        }
-      }
+    }
+    const std::string full_sandbox_path(opt.sandbox_root +
+                                        opt.bind_mount_targets[i]);
+
+    struct stat sb;
+    if (stat(opt.bind_mount_sources[i].c_str(), &sb) < 0) {
+      DIE("stat");
+    }
+    bool IsDirectory = S_ISDIR(sb.st_mode);
+    if (CreateTarget(full_sandbox_path.c_str(), IsDirectory) < 0) {
+      DIE("CreateTarget %s", full_sandbox_path.c_str());
+    }
+    int result =
+        mount(opt.bind_mount_sources[i].c_str(), full_sandbox_path.c_str(),
+              NULL, MS_REC | MS_BIND | MS_RDONLY, NULL);
+    if (result != 0) {
+      DIE("mount");
+    }
+  }
+  for (const std::string &writable_file : opt.writable_files) {
+    PRINT_DEBUG("writable: %s", writable_file.c_str());
+    if (mount(writable_file.c_str(), writable_file.c_str(), nullptr,
+              MS_BIND | MS_REC, nullptr) < 0) {
+      DIE("mount(%s, %s, nullptr, MS_BIND | MS_REC, nullptr)",
+          writable_file.c_str(), writable_file.c_str());
     }
   }
 }
 
+static void ChangeRoot() {
+  // move the real root to old_root, then detach it
+  char old_root[16] = "old-root-XXXXXX";
+  if (mkdtemp(old_root) == NULL) {
+    perror("mkdtemp");
+    DIE("mkdtemp returned NULL\n");
+  }
+  // pivot_root has no wrapper in libc, so we need syscall()
+  if (syscall(SYS_pivot_root, ".", old_root) < 0) {
+    DIE("syscall");
+  }
+  if (chroot(".") < 0) {
+    DIE("chroot");
+  }
+  if (umount2(old_root, MNT_DETACH) < 0) {
+    DIE("umount2");
+  }
+  if (rmdir(old_root) < 0) {
+    DIE("rmdir");
+  }
+}
+
 int Pid1Main(void *sync_pipe_param) {
+  PRINT_DEBUG("Pid1Main started");
+
   if (getpid() != 1) {
     DIE("Using PID namespaces, but we are not PID 1");
   }
 
+  // Start with default signal handlers and an empty signal mask.
+  ClearSignalMask();
+
   SetupSelfDestruction(reinterpret_cast<int *>(sync_pipe_param));
+
+  // Sandbox ourselves.
   SetupMountNamespace();
   SetupUserNamespace();
   if (opt.fake_hostname) {
     SetupUtsNamespace();
   }
-  MountFilesystems();
-  MakeFilesystemMostlyReadOnly();
-  MountProc();
+
+  if (opt.hermetic) {
+    MountSandboxAndGoThere();
+    CreateEmptyFile();
+    MountDev();
+    MountProc();
+    MountAllMounts();
+    ChangeRoot();
+  } else {
+    MountFilesystems();
+    MakeFilesystemMostlyReadOnly();
+    MountProc();
+  }
   SetupNetworking();
-  EnterSandbox();
-  SetupSignalHandlers();
+  EnterWorkingDirectory();
+
+  // Ignore terminal signals; we hand off the terminal to the child in
+  // SpawnChild below.
+  IgnoreSignal(SIGTTIN);
+  IgnoreSignal(SIGTTOU);
+
+  // Fork the child process.
   SpawnChild();
-  WaitForChild();
-  _exit(EXIT_FAILURE);
+
+  // Forward requests to shut down gracefully to the child.
+  InstallSignalHandler(SIGTERM, ForwardSignal);
+
+  // Note that there's no need to kill any remaining descendant processes; they
+  // are in our PID namespace and the kernel will send them SIGKILL
+  // automatically once we exit.
+  return WaitForChild();
 }

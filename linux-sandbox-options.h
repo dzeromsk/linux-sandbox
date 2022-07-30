@@ -28,6 +28,8 @@ struct Options {
   int timeout_secs;
   // How long to wait before sending SIGKILL in case of timeout (-t)
   int kill_delay_secs;
+  // Send a SIGTERM to the child on receipt of a SIGINT (-i)
+  bool sigint_sends_sigterm;
   // Where to redirect stdout (-l)
   std::string stdout_path;
   // Where to redirect stderr (-L)
@@ -52,6 +54,10 @@ struct Options {
   bool fake_username;
   // Print debugging messages (-D)
   bool debug;
+  // Improved hermetic build using whitelisting strategy (-h)
+  bool hermetic;
+  // The sandbox root directory (-s)
+  std::string sandbox_root;
   // Command to run (--)
   std::vector<char *> args;
 };
